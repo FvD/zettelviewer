@@ -3,10 +3,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use pulldown_cmark::{Parser, html, Options};
+use pulldown_cmark::{Parser, html, Options, Event, Tag, HeadingLevel};
 use warp::Filter;
 
-type HtmlCache = Arc<Mutex<HashMap<String, String>>>;
+// Store both HTML content and the title
+struct MarkdownInfo {
+    title: String,
+    html_content: String,
+}
+
+type HtmlCache = Arc<Mutex<HashMap<String, MarkdownInfo>>>;
 
 #[tokio::main]
 async fn main() {
@@ -32,20 +38,29 @@ async fn main() {
         .map(move |name: String| {
             let cache = cache.lock().unwrap();
             match cache.get(&name) {
-                Some(content) => warp::reply::html(content.clone()),
+                Some(info) => warp::reply::html(info.html_content.clone()),
                 None => warp::reply::html(format!("<h1>File not found: {}</h1>", name))
             }
         });
         
     let index = warp::path::end().map(move || {
         let cache = html_cache.lock().unwrap();
-        let file_list = cache.keys()
-            .map(|name| format!("<li><a href=\"/{}\">{}</a></li>", name, name))
+        let file_list = cache.iter()
+            .map(|(name, info)| {
+                format!("<li><a href=\"/{}\">{} - {}</a></li>", 
+                    name, 
+                    name, 
+                    if info.title.is_empty() { "[No title]" } else { &info.title }
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
             
         warp::reply::html(format!(
-            "<!DOCTYPE html>\n<html>\n<head>\n<title>Markdown Files</title>\n</head>\n<body>\n<h1>Available Files</h1>\n<ul>\n{}\n</ul>\n</body>\n</html>",
+            "<!DOCTYPE html>\n<html>\n<head>\n<title>Markdown Files</title>\n\
+            <style>\nbody {{ font-family: Arial, sans-serif; line-height: 1.6; padding: 20px; max-width: 800px; margin: 0 auto; }}\n\
+            li {{ margin-bottom: 8px; }}\n\
+            </style>\n</head>\n<body>\n<h1>Available Files</h1>\n<ul>\n{}\n</ul>\n</body>\n</html>",
             file_list
         ))
     });
@@ -76,8 +91,13 @@ fn load_markdown_files(folder_path: &str, html_cache: HtmlCache) -> std::io::Res
         
         if path.is_file() && path.extension().map_or(false, |ext| ext == "md") {
             let file_name = path.file_stem().unwrap().to_string_lossy().to_string();
-            let html_content = render_markdown_file(&path)?;
-            cache.insert(file_name, html_content);
+            let (title, html_content) = parse_markdown_file(&path)?;
+            
+            cache.insert(file_name, MarkdownInfo { 
+                title, 
+                html_content 
+            });
+            
             println!("Loaded: {}", path.display());
         }
     }
@@ -86,7 +106,7 @@ fn load_markdown_files(folder_path: &str, html_cache: HtmlCache) -> std::io::Res
     Ok(())
 }
 
-fn render_markdown_file(file_path: &PathBuf) -> std::io::Result<String> {
+fn parse_markdown_file(file_path: &PathBuf) -> std::io::Result<(String, String)> {
     // Read markdown content
     let markdown_content = fs::read_to_string(file_path)?;
     
@@ -97,9 +117,29 @@ fn render_markdown_file(file_path: &PathBuf) -> std::io::Result<String> {
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
     
-    let parser = Parser::new_ext(&markdown_content, options);
+    // First pass to extract title
+    let parser = Parser::new_ext(&markdown_content, options.clone());
+    let mut title = String::new();
+    let mut in_heading = false;
     
-    // Convert to HTML
+    for event in parser {
+        match event {
+            Event::Start(Tag::Heading(HeadingLevel::H1, _, _)) => {
+                in_heading = true;
+            },
+            Event::Text(text) if in_heading => {
+                title.push_str(&text);
+            },
+            Event::End(Tag::Heading(HeadingLevel::H1, _, _)) => {
+                in_heading = false;
+                break; // We only care about the first h1 heading
+            },
+            _ => {}
+        }
+    }
+    
+    // Second pass to generate HTML
+    let parser = Parser::new_ext(&markdown_content, options);
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
     
@@ -110,9 +150,9 @@ fn render_markdown_file(file_path: &PathBuf) -> std::io::Result<String> {
         pre {{ background-color: #f4f4f4; padding: 12px; border-radius: 4px; overflow-x: auto; }}\n\
         code {{ background-color: #f4f4f4; padding: 2px 4px; border-radius: 4px; }}\n\
         </style>\n</head>\n<body>\n{}\n</body>\n</html>",
-        file_path.file_stem().unwrap().to_string_lossy(),
+        if title.is_empty() { file_path.file_stem().unwrap().to_string_lossy().to_string() } else { title.clone() },
         html_output
     );
     
-    Ok(html_content)
+    Ok((title, html_content))
 }
